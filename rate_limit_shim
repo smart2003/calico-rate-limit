@@ -1,0 +1,351 @@
+#!/bin/bash
+# Copyright 2016 The Kubernetes Authors All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This is a wrapper around the Calico CNI driver that uses tc for QoS.
+
+function get_veth() {
+
+    NETNS_PATH=${1}
+    ETH=${2}
+    
+    # Get the process ID of the pause container:
+    local pid=$(echo $NETNS_PATH | cut -d'/' -f3)
+
+    # Make the container's network namespace available to the ip-netns command:
+    mkdir -p /var/run/netns
+    ln -sf $NETNS_PATH "/var/run/netns/${pid}"
+
+    # Get the veth pair index of the container's eth0:
+    local index=$(ip netns exec ${pid} ip link show $ETH | head -n1 | cut -d':' -f2 | sed "s/.*@if//")
+   
+    # Write the name of the veth interface to stdout:
+    local VETH=$(ip link show | grep "^${index}:" | sed "s/${index}: \(.*\):.*/\1/" | cut -d'@' -f1)
+
+    echo "pod veth is $VETH" >> $LOG
+
+    # Clean up the netns symlink, since we don't need it anymore
+    rm -f "/var/run/netns/${pid}"
+    echo $VETH
+}
+
+function setup_egress() {
+    NIC=$1
+    CLASS=$2
+    VETH=$3
+    MIN=$4
+    MAX=$5
+
+    # egress shaping
+    if [ "besteffort" != "$type" ]; then
+    	tc class add dev $NIC parent 1:1 classid 1:$CLASS htb prio $prio rate ${MIN}mbit ceil ${MAX}mbit burst 1m cburst 1m
+    else
+    	tc class add dev $NIC parent 1:3 classid 1:$CLASS htb prio $prio rate ${MIN}mbit ceil ${MAX}mbit burst 1m cburst 1m
+    fi
+
+    tc qdisc add dev $NIC parent 1:$CLASS handle $CLASS: sfq perturb 10 divisor 1024 
+    echo "created egress tc rules mapping ${VETH} to class ${CLASS} with prio ${prio} on NIC ${NIC}" >> $LOG
+
+    # this shows all the queues and their status so you can see if everything is working
+    tc -g -s class show dev $NIC >> $LOG
+    tc -g -s filter show dev $NIC >> $LOG
+
+}
+
+# usage: setup_qos nic id ip minrate maxrate
+# rates are in megabits/s
+# this must be called after the veth pair has been set up
+function setup_qos() {
+    #export ETCD_ENDPOINTS=$(echo $IN | jq -r .etcd_endpoints)
+    # We may use certs but kubeadm uses no auth
+    #cert=$(echo $IN | jq -r .etcd_ca_cert_file)
+    #if [ "null" != "$cert" ]; then
+    #    export ETCD_CA_CERT_FILE=$(echo $IN | jq -r .etcd_ca_cert_file)
+    #    export ETCD_CERT_FILE=$(echo $IN | jq -r .etcd_cert_file)
+    #    export ETCD_KEY_FILE=$(echo $IN | jq -r .etcd_key_file)
+    #fi
+    #VETH=$(calicoctl get wep --workload ${k8s_ns}.${k8s_pn} -o go-template='{{range .}}{{range .Items}}{{.Spec.InterfaceName}}{{end}}{{end}}')
+
+    VETH=$(get_veth $CNI_NETNS $CNI_IFNAME)
+    mkdir -p $CONFDIR
+    echo $VETH >> ${CONFDIR}/${k8s_pn}
+    
+    # TODO allocate classid properly (maybe take 4 digits from pod ID)
+    CLASS=$(printf "%x\n" $RANDOM)
+    # record the class ID so we can get it back later
+    echo $CLASS >> ${CONFDIR}/${k8s_pn}
+
+    setup_egress $INT_NIC $CLASS $VETH $int_min $int_max
+    setup_egress $EXT_NIC $CLASS $VETH 1 $ext_max
+    #iptables -t mangle -A PREROUTING -i $VETH -j MARK --set-mark 0x$CLASS
+    iptables -t mangle -A FORWARD -j CLASSIFY -i $VETH --set-class 1:0x$CLASS
+    
+    # ingress shaping
+    if [ "unlimited" != "$type" ]; then
+        tc qdisc add dev $VETH root handle 1: tbf rate ${int_min}mbit burst 1m latency 1ms
+    fi
+    echo "created ingress tc rules on veth ${VETH}" >> $LOG
+
+    tc -g -s qdisc show dev $VETH >> $LOG
+}
+
+function remove_qos() {
+    NIC=$1
+    ID=$2
+
+    #CLASS=$(cat ${CONFDIR}/${ID})
+    VETH=$(awk "NR==1" ${CONFDIR}/${ID} | tr -d '\n')
+    CLASS=$(awk "NR==2" ${CONFDIR}/${ID} | tr -d '\n')
+
+    #HANDLE=$(tc -g -s filter show dev $NIC | grep 1:$CLASS | awk '{print $10}')
+    #tc filter del dev $NIC parent 1: handle $HANDLE prio 1 protocol ip u32
+    iptables -t mangle -D FORWARD -j CLASSIFY -i $VETH --set-class 1:0x$CLASS
+    tc filter del dev $NIC parent 1: protocol ip prio $prio handle 0x$CLASS fw classid 1:$CLASS
+    tc class del dev $NIC classid 1:$CLASS
+    echo "deleted egress tc rules for class ${CLASS} on NIC ${NIC} and iptables rules on $VETH" >> $LOG
+
+    # everything else should be removed when the veth pair is destroyed
+
+    # this shows all the queues and their status so you can see if everything is working
+    tc -g -s class show dev $NIC >> $LOG
+    tc -g -s filter show dev $NIC >> $LOG
+    tc -g -s qdisc show dev $VETH >> $LOG
+
+}
+
+# XXX this is a kludge since /opt/cni/bin is mapped into the kubelet container
+# this is no longer needed but it doesn't hurt
+export PATH=$PATH:/opt/cni/bin
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/opt/cni/bin
+
+k8s_ns="$(printenv CNI_ARGS | tr ';' '\n' | grep ^K8S_POD_NAMESPACE= | cut -d= -f2)"
+k8s_pn="$(printenv CNI_ARGS | tr ';' '\n' | grep ^K8S_POD_NAME=      | cut -d= -f2)"
+
+debugme=yes
+
+if [ "$debugme" == yes ]; then
+    LOG=/tmp/${k8s_pn}
+    ERRLOG=${LOG}-err
+    # send stderr somewhere useful
+    exec 2<&-
+    exec 2<>$ERRLOG
+else
+    LOG=/dev/null
+fi
+
+if [ "$CNI_COMMAND" == "ADD" ]; then
+    date > $LOG
+else
+    date >> $LOG
+fi
+
+echo "cni-shim ($CNI_COMMAND) for ${k8s_ns}.${k8s_pn} (netns:$CNI_NETNS, if:$CNI_IFNAME)" >> $LOG
+
+printenv CNI_ARGS >> $LOG
+
+IN=$(cat)
+
+echo "${IN}" >> $LOG
+
+CONFDIR=/etc/cni
+
+#this reads the INT_NIC and EXT_NIC variables set in the per-node-qos-setup script
+source "${CONFDIR}/nic"
+if [ -z "$INT_NIC" ]; then
+    # XXX
+    echo "no NICs set, assuming bond0 & bond1" >> $LOG
+    INT_NIC=bond0
+    EXT_NIC=bond1
+fi
+
+apiserver=$(echo $IN | jq -r .policy.k8s_api_root )
+
+# there are different ways to contact the API server due to different k8s configurations
+if [ "$apiserver" != null ]; then
+    token=$(echo $IN | jq -r .policy.k8s_auth_token )
+
+    echo "k8s API server is ${apiserver}" >> $LOG
+
+    POD_JSON=$(curl --header "Authorization: Bearer ${token}" --insecure "$apiserver/api/v1/namespaces/$k8s_ns/pods/$k8s_pn")
+    NS_JSON=$(curl --header "Authorization: Bearer ${token}" --insecure "$apiserver/api/v1/namespaces/$k8s_ns")
+
+else
+    kcpath=$(echo $IN | jq -r .kubernetes.kubeconfig )
+    echo "kubeconfig is ${kcpath}" >> $LOG
+    kubeconfig=$(cat $kcpath)
+    # XXX sed is not a safe way to parse YAML
+    #apiserver=$(echo $kubeconfig | sed -n 's/server: \([^\s]\)/\1/p')
+    apiserver=$(sed -n 's/^[ \t]*server: \([^\s]\)/\1/p' $kcpath)
+    echo "k8s API server is ${apiserver}" >> $LOG
+
+    clientcert=$(sed -n 's/^[ \t]*client-certificate: \([^\s]\)/\1/p' $kcpath)
+    clientkey=$(sed -n 's/^[ \t]*client-key: \([^\s]\)/\1/p' $kcpath)
+
+    POD_JSON=$(curl --cert $clientcert --key $clientkey --insecure "$apiserver/api/v1/namespaces/$k8s_ns/pods/$k8s_pn")
+    NS_JSON=$(curl --cert $clientcert --key $clientkey --insecure "$apiserver/api/v1/namespaces/$k8s_ns")
+
+fi
+
+echo "$POD_JSON" >> $LOG
+echo "$NS_JSON" >> $LOG
+
+# extract QoS settings from k8s namespace annotations
+ns_network=$(echo $NS_JSON | jq -r .metadata.annotations )
+ext_max=$(echo $ns_network | jq -r '.["network.external.limit"]')
+int_max=$(echo $ns_network | jq -r '.["network.internal.limit"]')
+int_min=$(echo $ns_network | jq -r '.["network.internal.request"]')
+
+# also extract QoS settings from k8s pod annotations
+pod_network=$(echo $POD_JSON | jq -r .metadata.annotations )
+pod_ext_max=$(echo $pod_network | jq -r '.["network.external.limit"]')
+pod_int_max=$(echo $pod_network | jq -r '.["network.internal.limit"]')
+pod_int_min=$(echo $pod_network | jq -r '.["network.internal.request"]')
+
+# extract Qos settings from k8s container resources
+pod_spec=$(echo $POD_JSON | jq '.spec')
+container_requests=$(echo $pod_spec | jq -r '.containers[]|"\(.resources.requests)"')
+container_limits=$(echo $pod_spec | jq -r '.containers[]|"\(.resources.limits)"')
+network_requests=$(echo $container_requests | jq '.["pod.alpha.kubernetes.io/opaque-int-resource-network-internal"]' | sed 's/"//g' | tr [a-z] [A-Z] | numfmt --from=si)
+network_limits=$(echo $container_limits | jq '.["pod.alpha.kubernetes.io/opaque-int-resource-network-internal"]' | sed 's/"//g' | tr [a-z] [A-Z] | numfmt --from=si)
+
+#'tr [a-z] [A-Z] | numfmt --from=si' is used to convert 1k to 1K then to 1000. 
+
+echo $network_requests >> $LOG
+echo $network_limits >> $LOG
+
+pod_request="0"
+pod_limit="0"
+
+for request in $network_requests
+do
+    pod_request=$((pod_request + request))
+done
+
+for limit in $network_limits
+do
+    pod_limit=$((pod_limit + limit))
+done
+
+echo "pod_request: $pod_request, pod_limit: $pod_limit" >> $LOG
+
+echo "raw ns_ext_max: $ext_max ns_int_max: $int_max ns_int_min: $int_min pod_ext_max: $pod_ext_max pod_int_max: $pod_int_max pod_int_min: $pod_int_min" >> $LOG
+
+# pod annotations override namespace annotations
+if [ "null" != "$pod_int_max" ]; then
+    int_max=$pod_int_max
+fi
+if [ "null" != "$pod_int_min" ]; then
+    int_min=$pod_int_min
+fi
+if [ "null" != "$pod_ext_max" ]; then
+    ext_max=$pod_ext_max
+fi
+
+# opaque-int-resource override pod annotations
+if [ $pod_limit != 0 ]; then
+    int_max=$pod_limit
+    ext_max=$pod_limit
+fi
+if [ $pod_request != 0 ]; then
+    int_min=$pod_request
+fi
+
+# detect QoS class, set priority, and handle corner cases
+if [ "null" == "$int_min" ] && [ "null" == "$int_max" ] && [ "null" == "$ext_max" ]; then
+    type=unlimited
+    int_max=$INT_RATE
+    # TODO make this tunable?
+    int_min=1000
+    ext_max=$EXT_RATE
+    prio=1
+
+elif [ "null" != "$int_max" ] && [ "$int_min" -ge 100 ] && [ "$int_max" -ne "$int_min" ]; then
+    type=burstable
+    prio=2
+
+elif [ "null" != "$int_max" ] && [ "null" == "$int_min" ]; then
+    echo "no internal min rate for pod, setting to 100Mbit" >> $LOG
+    int_min=100
+    type=besteffort
+    prio=3
+    # XXX this is a problem for ingress
+elif [ "null" != "$int_max" ] && [ "$int_min" -lt 100 ]; then
+    echo "internal min rate too low, setting to 100Mbit" >> $LOG
+    int_min=100
+    type=besteffort
+    prio=3
+    # XXX this is a problem for ingress
+elif [ "null" == "$int_max" ]; then
+    echo "no internal max rate for pod, setting to 100Mbit" >> $LOG
+    int_max=100
+
+elif [ "$int_max" -lt "$int_min" ]; then
+    echo "internal min rate is greater than max; this is not allowed" >> $LOG
+    int_min=$int_max
+
+elif [ "$int_max" -eq "$int_min" ]; then
+    type=guaranteed
+    prio=1
+fi
+
+echo "final class: $type prio: $prio ext_max: $ext_max int_max: $int_max int_min: $int_min" >> $LOG
+
+case "${CNI_COMMAND}" in
+    (ADD)
+
+        echo "calling real calico" >> $LOG
+        OUT=$(echo "$IN" | /opt/cni/bin/real-calico)
+
+        echo "calico output:" >> $LOG
+        echo $OUT >> $LOG
+
+        # capture IP address assigned by Calico
+        IP=$(echo $OUT | jq -r .ip4.ip)
+        echo "pod IP address is ${IP}" >> $LOG
+
+        setup_qos
+        logger -t network-qos "CNI shim setup network QoS for pod ${k8s_ns}.${k8s_pn}: mapped veth ${VETH} to tc class ${CLASS}. ${int_min}-${int_max} Mbps on internal NIC ${INT_NIC}, ${ext_max} Mbps on external NIC ${EXT_NIC}"
+        echo "CNI done" >> $LOG
+        echo $OUT
+        exit 0
+
+        ;;
+
+    (DEL)
+
+        echo "calling real calico" >> $LOG
+        OUT=$(echo "$IN" | /opt/cni/bin/real-calico)
+
+        echo "calico output:" >> $LOG
+        echo $OUT >> $LOG
+
+        if [ -f ${CONFDIR}/${k8s_pn} ]; then
+            remove_qos ${INT_NIC} ${k8s_pn}
+            remove_qos ${EXT_NIC} ${k8s_pn}
+            logger -t network-qos "CNI shim removes network QoS for pod ${k8s_ns}.${k8s_pn}: mapped veth ${VETH} to tc class ${CLASS}. ${int_min}-${int_max} Mbps on internal NIC ${INT_NIC}, ${ext_max} Mbps on external NIC ${EXT_NIC}"
+            rm ${CONFDIR}/${k8s_pn}
+        else
+            echo "Pod has no bandwidth limit, nothing to remove" >> $LOG
+        fi
+
+        echo $OUT
+        exit 0
+
+        ;;
+
+    (*)
+        echo "Unexpected CNI_COMMAND ($CNI_COMMAND)!" >& 2
+        exit 2
+        ;;
+esac
